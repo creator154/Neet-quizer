@@ -1,12 +1,14 @@
+# bot.py - Complete NEET Quizer Bot (Telegram Quiz Style)
 import logging
 import os
 from dotenv import load_dotenv
-from telegram import Update, Poll
+from telegram import Update, Poll, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     PollAnswerHandler,
+    CallbackQueryHandler,
     filters,
     ContextTypes,
 )
@@ -15,154 +17,233 @@ load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# In-memory storage (user_id -> quiz data)
-users = {}  # {user_id: {'title': str, 'desc': str or None, 'questions': [], 'state': 'title'/'desc'/'questions', 'score': 0}}
+# In-memory storage (per user quiz data)
+users = {}  # user_id → {'title', 'desc', 'questions', 'current_q', 'score', 'state'}
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "Welcome to Dev's NEET Quiz Bot! 🚀\n"
-        "Commands:\n/create - Naya quiz banao\n/startquiz - Quiz shuru karo (jab questions add ho jaye)"
+# ────────────────────────────────────────────────
+# Helper: Send next question as quiz poll
+# ────────────────────────────────────────────────
+async def send_next_question(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if user_id not in users:
+        return
+
+    data = users[user_id]
+
+    if data['current_q'] >= len(data['questions']):
+        percentage = (data['score'] / len(data['questions'])) * 100 if data['questions'] else 0
+        msg = (
+            f"🎉 Quiz Complete!\n\n"
+            f"Title: {data['title']}\n"
+            f"Correct: {data['score']} / {len(data['questions'])}\n"
+            f"Score: {percentage:.1f}%"
+        )
+        await context.bot.send_message(chat_id, msg)
+        data['state'] = 'idle'
+        return
+
+    q = data['questions'][data['current_q']]
+    await context.bot.send_poll(
+        chat_id=chat_id,
+        question=q['text'],
+        options=q['options'],
+        type=Poll.QUIZ,
+        correct_option_id=q['correct_id'],
+        is_anonymous=False,
+        allows_multiple_answers=False,
+        protect_content=False
     )
 
-async def create(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    users[user_id] = {
-        "title": None,
-        "desc": None,
-        "questions": [],  # List of {'text': str, 'options': list, 'correct_id': int}
-        "state": "title",
-        "score": 0,
-    }
-    await update.message.reply_text("Quiz ka title bhejo (e.g. NEET Biology 2026):")
 
+# ────────────────────────────────────────────────
+# /start – Welcome with buttons
+# ────────────────────────────────────────────────
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    keyboard = [
+        [InlineKeyboardButton("➕ Create New Quiz", callback_data='create')],
+        [InlineKeyboardButton("▶️ Start My Quiz", callback_data='start_quiz')],
+        [InlineKeyboardButton("❓ Help", callback_data='help')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    text = (
+        "🚀 **Welcome to NEET Quizer Bot!**\n\n"
+        "Custom NEET-style quizzes banao aur practice karo.\n"
+        "Group ya DM dono mein chalega.\n\n"
+        "Shuru karne ke liye button dabao 👇"
+    )
+    await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+
+
+# ────────────────────────────────────────────────
+# Button clicks (create, start, help)
+# ────────────────────────────────────────────────
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    data = query.data
+
+    if data == 'create':
+        users[user_id] = {
+            'title': None,
+            'desc': None,
+            'questions': [],
+            'current_q': 0,
+            'score': 0,
+            'state': 'title'
+        }
+        await query.edit_message_text("Quiz ka title bhejo (jaise: NEET Biology Mock 2026)")
+
+    elif data == 'start_quiz':
+        if user_id not in users or not users[user_id].get('questions'):
+            await query.edit_message_text("Pehle quiz banao questions ke saath!")
+            return
+        users[user_id]['state'] = 'quiz'
+        users[user_id]['current_q'] = 0
+        users[user_id]['score'] = 0
+        await query.edit_message_text(f"Starting **{users[user_id]['title']}** 🔥 Good luck!")
+        await send_next_question(query.message.chat_id, user_id, context)
+
+    elif data == 'help':
+        help_text = (
+            "Commands:\n"
+            "/start - Yeh message\n"
+            "/create - Naya quiz shuru karo (button se bhi)\n"
+            "Poll bhej ke questions add karo (Quiz mode on)\n"
+            "/done - Quiz creation finish\n"
+            "/startquiz - Quiz chalao\n\n"
+            "Group mein add karke sab saath practice kar sakte ho."
+        )
+        await query.edit_message_text(help_text)
+
+
+# ────────────────────────────────────────────────
+# Text messages (title, desc, skip)
+# ────────────────────────────────────────────────
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     text = update.message.text.strip()
 
-    if user_id not in users:
-        await update.message.reply_text("Pehle /create karo!")
+    if user_id not in users or users[user_id]['state'] in ['idle', 'quiz']:
         return
 
-    data = users[user_id]
-    state = data["state"]
+    state = users[user_id]['state']
 
-    if state == "title":
-        data["title"] = text
-        data["state"] = "desc"
+    if state == 'title':
+        users[user_id]['title'] = text
+        users[user_id]['state'] = 'desc'
         await update.message.reply_text(
-            f"Title set: {text}\n\nAb description bhejo (optional) ya /skip"
+            f"Title set: {text}\n\n"
+            "Description bhejo (optional) ya /skip"
         )
         return
 
-    if state == "desc":
-        if text.lower() == "/skip":
-            data["desc"] = None
+    if state == 'desc':
+        if text.lower() in ['/skip', 'skip']:
+            users[user_id]['desc'] = None
         else:
-            data["desc"] = text
-        data["state"] = "questions"
+            users[user_id]['desc'] = text
+
+        users[user_id]['state'] = 'questions'
         await update.message.reply_text(
-            "Good! Ab har question ke liye poll bhejo:\n"
-            "- Poll type: Quiz\n"
-            "- Correct option select karo\n"
-            "- Question text + 4 options daalo\n"
-            "Jab khatam ho to /done bhejo"
+            "Ab questions add karo:\n"
+            "• Telegram mein Poll banao → Type: Quiz\n"
+            "• Sahi option select karo\n"
+            "• Question + options daalo\n\n"
+            "Jab khatam ho to /done likh do"
         )
         return
 
-    if text == "/done":
-        if not data["questions"]:
-            await update.message.reply_text("Koi question nahi add kiya! Pehle poll bhejo.")
-            return
-        await update.message.reply_text(
-            f"Quiz ready! Title: {data['title']}\n"
-            f"Questions: {len(data['questions'])}\n"
-            "/startquiz se shuru kar sakte ho (DM ya group mein)"
-        )
-        return
 
-    await update.message.reply_text("Poll bhejo ya /done karo!")
-
+# ────────────────────────────────────────────────
+# Receive poll during creation
+# ────────────────────────────────────────────────
 async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Poll jab user bhejta hai creation mode mein
     if update.message.poll is None:
         return
 
     user_id = update.effective_user.id
-    if user_id not in users or users[user_id]["state"] != "questions":
+    if user_id not in users or users[user_id]['state'] != 'questions':
         return
 
     poll = update.message.poll
-    if poll.type != Poll.QUIZ:
-        await update.message.reply_text("Sirf Quiz type poll bhejo!")
+
+    if poll.type != Poll.QUIZ or poll.correct_option_id is None:
+        await update.message.reply_text("Quiz type poll bhejo aur sahi option select karna mat bhoolna!")
         return
 
-    if poll.correct_option_id is None:
-        await update.message.reply_text("Correct option select karna bhool gaye poll mein!")
+    users[user_id]['questions'].append({
+        'text': poll.question,
+        'options': [opt.text for opt in poll.options],
+        'correct_id': poll.correct_option_id
+    })
+
+    count = len(users[user_id]['questions'])
+    await update.message.reply_text(f"Question {count} add ho gaya! 🎯\nAgla poll bhejo ya /done")
+
+
+# ────────────────────────────────────────────────
+# Finish creation
+# ────────────────────────────────────────────────
+async def done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if user_id not in users or users[user_id]['state'] != 'questions':
         return
 
-    users[user_id]["questions"].append(
-        {
-            "text": poll.question,
-            "options": poll.options,
-            "correct_id": poll.correct_option_id,
-        }
-    )
-    await update.message.reply_text(
-        f"Question added! ({len(users[user_id]['questions'])} total)\n"
-        "Agla poll bhejo ya /done"
-    )
+    if not users[user_id]['questions']:
+        await update.message.reply_text("Koi question add nahi kiya!")
+        return
 
+    users[user_id]['state'] = 'idle'
+    q_count = len(users[user_id]['questions'])
+    text = f"Quiz taiyar hai!\n\nTitle: {users[user_id]['title']}\nQuestions: {q_count}\n\n/startquiz se shuru kar sakte ho."
+    await update.message.reply_text(text)
+
+
+# ────────────────────────────────────────────────
+# Handle user's answer during quiz
+# ────────────────────────────────────────────────
 async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Jab user quiz ke dauran answer deta hai
     poll_answer = update.poll_answer
     user_id = poll_answer.user.id
 
-    if user_id not in users:
+    if user_id not in users or users[user_id]['state'] != 'quiz':
         return
 
     data = users[user_id]
-    # Yahan logic add karo score ke liye (future: current question track karo)
-    # Abhi simple: just acknowledge
-    await context.bot.send_message(
-        chat_id=user_id, text="Answer recorded! (Score update soon...)"
-    )
+    selected = poll_answer.option_ids[0] if poll_answer.option_ids else -1
 
-async def start_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    if user_id not in users or not users[user_id]["questions"]:
-        await update.message.reply_text("Pehle quiz create karo questions ke saath!")
-        return
+    if selected == data['questions'][data['current_q']]['correct_id']:
+        data['score'] += 1
+        await context.bot.send_message(user_id, "Sahiii! ✅ +1")
+    else:
+        await context.bot.send_message(user_id, "Galat! ❌")
 
-    data = users[user_id]
-    await update.message.reply_text(f"Starting {data['title']}... Good luck! 🔥")
+    data['current_q'] += 1
+    await send_next_question(poll_answer.user.id, user_id, context)
 
-    # Send first question as quiz poll
-    q = data["questions"][0]  # Abhi sirf first, baad mein loop banao
-    await update.message.reply_poll(
-        question=q["text"],
-        options=[opt.text for opt in q["options"]],
-        type=Poll.QUIZ,
-        correct_option_id=q["correct_id"],
-        is_anonymous=False,  # Group mein visible rahe
-    )
-    # Future: timer, next question on answer, score track
 
-def main() -> None:
-    application = Application.builder().token(TOKEN).build()
+# ────────────────────────────────────────────────
+# Main
+# ────────────────────────────────────────────────
+def main():
+    app = Application.builder().token(TOKEN).build()
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("create", create))
-    application.add_handler(CommandHandler("done", handle_text))  # /done as command
-    application.add_handler(MessageHandler(filters.TEXT & \~filters.COMMAND, handle_text))
-    application.add_handler(MessageHandler(filters.POLL, handle_poll))
-    application.add_handler(PollAnswerHandler(handle_poll_answer))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(button_callback))
+    app.add_handler(CommandHandler("done", done))
+    app.add_handler(MessageHandler(filters.TEXT & \~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(filters.POLL, handle_poll))
+    app.add_handler(PollAnswerHandler(handle_poll_answer))
 
-    print("Bot starting...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    print("NEET Quizer Bot chal raha hai...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()
