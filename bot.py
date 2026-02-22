@@ -1,249 +1,152 @@
-# bot.py - Complete NEET Quizer Bot (Telegram Quiz Style)
+import asyncio
 import logging
-import os
-from dotenv import load_dotenv
-from telegram import Update, Poll, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    PollAnswerHandler,
-    CallbackQueryHandler,
-    filters,
-    ContextTypes,
-)
+import random
+import aiosqlite
 
-load_dotenv()
-TOKEN = os.getenv("BOT_TOKEN")
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, PollAnswer
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
 
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+from config import BOT_TOKEN
+from database import init_db, DB_NAME
+from states import CreateQuiz
 
-# In-memory storage (per user quiz data)
-users = {}  # user_id → {'title', 'desc', 'questions', 'current_q', 'score', 'state'}
+logging.basicConfig(level=logging.INFO)
 
-# ────────────────────────────────────────────────
-# Helper: Send next question as quiz poll
-# ────────────────────────────────────────────────
-async def send_next_question(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if user_id not in users:
-        return
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
 
-    data = users[user_id]
+active_sessions = {}
 
-    if data['current_q'] >= len(data['questions']):
-        percentage = (data['score'] / len(data['questions'])) * 100 if data['questions'] else 0
-        msg = (
-            f"🎉 Quiz Complete!\n\n"
-            f"Title: {data['title']}\n"
-            f"Correct: {data['score']} / {len(data['questions'])}\n"
-            f"Score: {percentage:.1f}%"
+# START
+@dp.message(Command("start"))
+async def start(message: Message):
+    await message.answer("Welcome!\nUse /create to create quiz")
+
+# CREATE QUIZ
+@dp.message(Command("create"))
+async def create_quiz(message: Message, state: FSMContext):
+    await state.set_state(CreateQuiz.title)
+    await message.answer("Send Quiz Title")
+
+@dp.message(CreateQuiz.title)
+async def set_title(message: Message, state: FSMContext):
+    await state.update_data(title=message.text)
+    await state.set_state(CreateQuiz.question)
+    await message.answer("Send Question")
+
+@dp.message(CreateQuiz.question)
+async def set_question(message: Message, state: FSMContext):
+    await state.update_data(question=message.text)
+    await state.set_state(CreateQuiz.option1)
+    await message.answer("Option 1")
+
+@dp.message(CreateQuiz.option1)
+async def set_o1(message: Message, state: FSMContext):
+    await state.update_data(option1=message.text)
+    await state.set_state(CreateQuiz.option2)
+    await message.answer("Option 2")
+
+@dp.message(CreateQuiz.option2)
+async def set_o2(message: Message, state: FSMContext):
+    await state.update_data(option2=message.text)
+    await state.set_state(CreateQuiz.option3)
+    await message.answer("Option 3")
+
+@dp.message(CreateQuiz.option3)
+async def set_o3(message: Message, state: FSMContext):
+    await state.update_data(option3=message.text)
+    await state.set_state(CreateQuiz.option4)
+    await message.answer("Option 4")
+
+@dp.message(CreateQuiz.option4)
+async def set_o4(message: Message, state: FSMContext):
+    await state.update_data(option4=message.text)
+    await state.set_state(CreateQuiz.correct)
+    await message.answer("Correct option number (1-4)")
+
+@dp.message(CreateQuiz.correct)
+async def set_correct(message: Message, state: FSMContext):
+    await state.update_data(correct=int(message.text)-1)
+    await state.set_state(CreateQuiz.timer)
+    await message.answer("Timer in seconds")
+
+@dp.message(CreateQuiz.timer)
+async def save_quiz(message: Message, state: FSMContext):
+    data = await state.get_data()
+    timer = int(message.text)
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "INSERT INTO quizzes (creator_id,title,timer,shuffle) VALUES (?,?,?,?)",
+            (message.from_user.id, data["title"], timer, 0)
         )
-        await context.bot.send_message(chat_id, msg)
-        data['state'] = 'idle'
+        quiz_id = (await db.execute("SELECT last_insert_rowid()")).fetchone()
+        quiz_id = (await quiz_id)[0]
+
+        await db.execute("""
+        INSERT INTO questions (quiz_id,question,option1,option2,option3,option4,correct)
+        VALUES (?,?,?,?,?,?,?)
+        """, (quiz_id,data["question"],data["option1"],data["option2"],
+              data["option3"],data["option4"],data["correct"]))
+        await db.commit()
+
+    await state.clear()
+    await message.answer(f"Quiz Created!\nStart in group using:\n/startquiz {quiz_id}")
+
+# START QUIZ IN GROUP
+@dp.message(Command("startquiz"))
+async def start_group_quiz(message: Message):
+    if message.chat.type == "private":
         return
 
-    q = data['questions'][data['current_q']]
-    await context.bot.send_poll(
-        chat_id=chat_id,
-        question=q['text'],
-        options=q['options'],
-        type=Poll.QUIZ,
-        correct_option_id=q['correct_id'],
-        is_anonymous=False,
-        allows_multiple_answers=False,
-        protect_content=False
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("Usage: /startquiz quiz_id")
+        return
+
+    quiz_id = int(args[1])
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        quiz = await db.execute("SELECT timer FROM quizzes WHERE id=?", (quiz_id,))
+        quiz = await quiz.fetchone()
+
+        question = await db.execute("SELECT * FROM questions WHERE quiz_id=?", (quiz_id,))
+        question = await question.fetchone()
+
+    if not quiz:
+        await message.answer("Quiz not found")
+        return
+
+    timer = quiz[0]
+
+    active_sessions[message.chat.id] = {
+        "correct": question[7],
+        "scores": {}
+    }
+
+    await bot.send_poll(
+        chat_id=message.chat.id,
+        question=question[2],
+        options=[question[3],question[4],question[5],question[6]],
+        type="quiz",
+        correct_option_id=question[7],
+        open_period=timer
     )
 
+# HANDLE ANSWERS
+@dp.poll_answer()
+async def handle_answer(poll_answer: PollAnswer):
+    for session in active_sessions.values():
+        correct = session["correct"]
+        if poll_answer.option_ids[0] == correct:
+            session["scores"][poll_answer.user.id] = session["scores"].get(poll_answer.user.id,0)+1
 
-# ────────────────────────────────────────────────
-# /start – Welcome with buttons
-# ────────────────────────────────────────────────
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    keyboard = [
-        [InlineKeyboardButton("➕ Create New Quiz", callback_data='create')],
-        [InlineKeyboardButton("▶️ Start My Quiz", callback_data='start_quiz')],
-        [InlineKeyboardButton("❓ Help", callback_data='help')],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+async def main():
+    await init_db()
+    await dp.start_polling(bot)
 
-    text = (
-        "🚀 **Welcome to NEET Quizer Bot!**\n\n"
-        "Custom NEET-style quizzes banao aur practice karo.\n"
-        "Group ya DM dono mein chalega.\n\n"
-        "Shuru karne ke liye button dabao 👇"
-    )
-    await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-
-
-# ────────────────────────────────────────────────
-# Button clicks (create, start, help)
-# ────────────────────────────────────────────────
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    data = query.data
-
-    if data == 'create':
-        users[user_id] = {
-            'title': None,
-            'desc': None,
-            'questions': [],
-            'current_q': 0,
-            'score': 0,
-            'state': 'title'
-        }
-        await query.edit_message_text("Quiz ka title bhejo (jaise: NEET Biology Mock 2026)")
-
-    elif data == 'start_quiz':
-        if user_id not in users or not users[user_id].get('questions'):
-            await query.edit_message_text("Pehle quiz banao questions ke saath!")
-            return
-        users[user_id]['state'] = 'quiz'
-        users[user_id]['current_q'] = 0
-        users[user_id]['score'] = 0
-        await query.edit_message_text(f"Starting **{users[user_id]['title']}** 🔥 Good luck!")
-        await send_next_question(query.message.chat_id, user_id, context)
-
-    elif data == 'help':
-        help_text = (
-            "Commands:\n"
-            "/start - Yeh message\n"
-            "/create - Naya quiz shuru karo (button se bhi)\n"
-            "Poll bhej ke questions add karo (Quiz mode on)\n"
-            "/done - Quiz creation finish\n"
-            "/startquiz - Quiz chalao\n\n"
-            "Group mein add karke sab saath practice kar sakte ho."
-        )
-        await query.edit_message_text(help_text)
-
-
-# ────────────────────────────────────────────────
-# Text messages (title, desc, skip)
-# ────────────────────────────────────────────────
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    text = update.message.text.strip()
-
-    if user_id not in users or users[user_id]['state'] in ['idle', 'quiz']:
-        return
-
-    state = users[user_id]['state']
-
-    if state == 'title':
-        users[user_id]['title'] = text
-        users[user_id]['state'] = 'desc'
-        await update.message.reply_text(
-            f"Title set: {text}\n\n"
-            "Description bhejo (optional) ya /skip"
-        )
-        return
-
-    if state == 'desc':
-        if text.lower() in ['/skip', 'skip']:
-            users[user_id]['desc'] = None
-        else:
-            users[user_id]['desc'] = text
-
-        users[user_id]['state'] = 'questions'
-        await update.message.reply_text(
-            "Ab questions add karo:\n"
-            "• Telegram mein Poll banao → Type: Quiz\n"
-            "• Sahi option select karo\n"
-            "• Question + options daalo\n\n"
-            "Jab khatam ho to /done likh do"
-        )
-        return
-
-
-# ────────────────────────────────────────────────
-# Receive poll during creation
-# ────────────────────────────────────────────────
-async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message.poll is None:
-        return
-
-    user_id = update.effective_user.id
-    if user_id not in users or users[user_id]['state'] != 'questions':
-        return
-
-    poll = update.message.poll
-
-    if poll.type != Poll.QUIZ or poll.correct_option_id is None:
-        await update.message.reply_text("Quiz type poll bhejo aur sahi option select karna mat bhoolna!")
-        return
-
-    users[user_id]['questions'].append({
-        'text': poll.question,
-        'options': [opt.text for opt in poll.options],
-        'correct_id': poll.correct_option_id
-    })
-
-    count = len(users[user_id]['questions'])
-    await update.message.reply_text(f"Question {count} add ho gaya! 🎯\nAgla poll bhejo ya /done")
-
-
-# ────────────────────────────────────────────────
-# Finish creation
-# ────────────────────────────────────────────────
-async def done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    if user_id not in users or users[user_id]['state'] != 'questions':
-        return
-
-    if not users[user_id]['questions']:
-        await update.message.reply_text("Koi question add nahi kiya!")
-        return
-
-    users[user_id]['state'] = 'idle'
-    q_count = len(users[user_id]['questions'])
-    text = f"Quiz taiyar hai!\n\nTitle: {users[user_id]['title']}\nQuestions: {q_count}\n\n/startquiz se shuru kar sakte ho."
-    await update.message.reply_text(text)
-
-
-# ────────────────────────────────────────────────
-# Handle user's answer during quiz
-# ────────────────────────────────────────────────
-async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    poll_answer = update.poll_answer
-    user_id = poll_answer.user.id
-
-    if user_id not in users or users[user_id]['state'] != 'quiz':
-        return
-
-    data = users[user_id]
-    selected = poll_answer.option_ids[0] if poll_answer.option_ids else -1
-
-    if selected == data['questions'][data['current_q']]['correct_id']:
-        data['score'] += 1
-        await context.bot.send_message(user_id, "Sahiii! ✅ +1")
-    else:
-        await context.bot.send_message(user_id, "Galat! ❌")
-
-    data['current_q'] += 1
-    await send_next_question(poll_answer.user.id, user_id, context)
-
-
-# ────────────────────────────────────────────────
-# Main
-# ────────────────────────────────────────────────
-def main():
-    app = Application.builder().token(TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button_callback))
-    app.add_handler(CommandHandler("done", done))
-    app.add_handler(MessageHandler(filters.TEXT & \~filters.COMMAND, handle_text))
-    app.add_handler(MessageHandler(filters.POLL, handle_poll))
-    app.add_handler(PollAnswerHandler(handle_poll_answer))
-
-    print("NEET Quizer Bot chal raha hai...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    asyncio.run(main())
